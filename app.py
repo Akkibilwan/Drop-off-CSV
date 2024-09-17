@@ -1,65 +1,67 @@
 import streamlit as st
 import pandas as pd
+from collections import defaultdict
+import io
 
-def process_data(data):
-    try:
-        # Clean and parse session times
-        data['Cleaned Session End'] = data['Sessions'].str.split(' - ').str[1].str.split('\n').str[0]
-        data['Session Start'] = pd.to_datetime(data['Sessions'].str.split(' - ').str[0], format='%d/%m/%Y, %I:%M:%S %p')
-        data['Session End'] = pd.to_datetime(data['Cleaned Session End'].str.strip(), format='%d/%m/%Y, %I:%M:%S %p')
+st.title("Cohort Session Attendance Analysis")
 
-        # Create a range of times at 5-minute intervals between the earliest and latest times in the data
-        start_time = data['Session Start'].min().floor('5T')
-        end_time = data['Session End'].max().ceil('5T')
-        time_range = pd.date_range(start=start_time, end=end_time, freq='5T')
+# File uploader
+uploaded_file = st.file_uploader("Upload your CSV file", type=["csv"])
 
-        # Initialize a DataFrame to hold drop-off counts and users present
-        drop_off_counts = pd.DataFrame(0, index=time_range, columns=['Drop-offs', 'Users Present'])
+if uploaded_file is not None:
+    # Load data
+    df = pd.read_csv(uploaded_file, skiprows=1)
+    df.columns = ["Sl No", "User Name", "User Email", "User ID", "Duration", "Sessions"]
 
-        # Calculate the drop-offs and users present for each 5-minute interval
-        for i in range(len(time_range) - 1):
-            current_interval = (data['Session End'] >= time_range[i]) & (data['Session End'] < time_range[i + 1])
-            users_present = (data['Session Start'] <= time_range[i]) & (data['Session End'] >= time_range[i])
-            
-            drop_off_counts.loc[time_range[i], 'Drop-offs'] = current_interval.sum()
-            drop_off_counts.loc[time_range[i], 'Users Present'] = users_present.sum()
+    # Function to convert duration string to minutes
+    def duration_to_minutes(duration):
+        if 'h' in duration:
+            hours = int(duration.split('h')[0])
+            minutes = int(duration.split('h')[1].split('m')[0]) if 'm' in duration else 0
+            return hours * 60 + minutes
+        elif 'm' in duration:
+            return int(duration.split('m')[0])
+        else:
+            return 0
 
-        drop_off_counts['Time'] = drop_off_counts.index.strftime('%H:%M')
-        drop_off_counts.reset_index(drop=True, inplace=True)
+    # Function to parse sessions and calculate retention/drop-off
+    def calculate_retention_dropoff(sessions_str):
+        retained_users = defaultdict(int)
+        dropped_users = defaultdict(int)
+        for session in sessions_str.strip().split('\n'):
+            start_time_str, end_time_str = session.split(' - ')
+            start_time = pd.to_datetime(start_time_str, format='%d/%m/%Y, %I:%M:%S %p')
+            end_time = pd.to_datetime(end_time_str, format='%d/%m/%Y, %I:%M:%S %p')
+            session_duration_minutes = (end_time - start_time).total_seconds() // 60
+            for i in range(int(session_duration_minutes // 5) + 1):
+                interval_start = start_time + pd.Timedelta(minutes=i * 5)
+                interval_end = min(start_time + pd.Timedelta(minutes=(i + 1) * 5), end_time)
+                time_interval_str = interval_start.strftime('%H:%M:%S')
+                retained_users[time_interval_str] += 1
+                if interval_end == end_time:
+                    dropped_users[interval_end.strftime('%H:%M:%S')] += 1
+        return retained_users, dropped_users
 
-        return drop_off_counts
-    except Exception as e:
-        st.error(f"An error occurred while processing the data: {e}")
-        return None
+    # Calculate retention/drop-off for all users
+    retention_dropoff_data = []
+    for index, row in df.iterrows():
+        sessions_str = row["Sessions"]
+        retained_users, dropped_users = calculate_retention_dropoff(sessions_str)
+        for interval, count in retained_users.items():
+            retention_dropoff_data.append([interval, count, dropped_users.get(interval, 0)])
 
-def main():
-    st.title("Session Analysis: Drop-offs and Users Present")
-    st.write("Upload a CSV file containing session data to generate a report with drop-off counts and users present.")
+    # Create DataFrame
+    retention_df = pd.DataFrame(retention_dropoff_data, columns=["Time Interval", "Users Retained", "Users Dropped"])
+    retention_df = retention_df.groupby("Time Interval").sum().reset_index()
 
-    # File uploader
-    uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
+    # Display DataFrame
+    st.dataframe(retention_df)
 
-    if uploaded_file is not None:
-        # Read the CSV file
-        try:
-            data = pd.read_csv(uploaded_file)
-            if 'Sessions' not in data.columns:
-                st.error("The uploaded CSV file does not have the required 'Sessions' column.")
-                return
-
-            # Process the data to get drop-off counts and users present
-            report = process_data(data)
-
-            if report is not None:
-                # Display the report
-                st.write("Report: Drop-offs and Users Present Every 5 Minutes")
-                st.dataframe(report)
-
-                # Convert DataFrame to CSV
-                csv = report.to_csv(index=False).encode('utf-8')
-                st.download_button(label="Download Report CSV", data=csv, file_name='drop_off_and_presence_report.csv', mime='text/csv')
-        except Exception as e:
-            st.error(f"An error occurred while reading the CSV file: {e}")
-
-if __name__ == "__main__":
-    main()
+    # Download button
+    csv_buffer = io.StringIO()
+    retention_df.to_csv(csv_buffer, index=False)
+    csv_string = csv_buffer.getvalue()
+    st.download_button(label="Download data as CSV",
+                       data=csv_string,
+                       file_name="retention_data.csv",
+                       mime='text/csv')
